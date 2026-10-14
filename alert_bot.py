@@ -3,16 +3,41 @@
 # Exit plan (from the backtest): target +10%, stoploss -5%, or after 10 trading days.
 import os, sys, json, time, urllib.request, urllib.parse
 import numpy as np, pandas as pd
-import strategy_lab as s
-import nifty50_supertrend_backtest as b
 
-UNIVERSE = "nifty200"
 TARGET, STOP, MAX_DAYS = 0.10, 0.05, 10
 FRESH_MIN = 55                      # signal candle must have closed within the last 55 minutes
 STATE = "alerted.json"              # remembers sent alerts so the same signal is never sent twice
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 TZ = "Asia/Kolkata"
+
+URLS = ["https://niftyindices.com/IndexConstituent/ind_nifty200list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"]
+
+def get_universe():
+    import io
+    for url in URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            raw = urllib.request.urlopen(req, timeout=30).read()
+            syms = pd.read_csv(io.BytesIO(raw))["Symbol"].str.strip().tolist()
+            print("Loaded", len(syms), "symbols")
+            return syms
+        except Exception as e:
+            print("list download failed:", url, e)
+    sys.exit("Could not download the stock list")
+
+def adx(df, n=14):
+    up, dn = df.High.diff(), -df.Low.diff()
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    pc = df.Close.shift(1)
+    tr = pd.concat([df.High - df.Low, (df.High - pc).abs(), (df.Low - pc).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/n, adjust=False).mean()
+    pdi = 100 * pd.Series(pdm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atr
+    mdi = 100 * pd.Series(mdm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atr
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=1/n, adjust=False).mean()
 
 def send(text):
     if not TOKEN or not CHAT:
@@ -46,11 +71,11 @@ def analyze(df, now):
     if now - end > pd.Timedelta(minutes=FRESH_MIN): return None   # stale data
     c = df.Close
     e20, e50, e200 = (c.ewm(span=x, adjust=False).mean() for x in (20, 50, 200))
-    adx = s.adx(df)
+    adx_v = adx(df)
     vx = df.Volume / df.Volume.rolling(20).mean()
     cross = e20.iloc[-1] > e50.iloc[-1] and e20.iloc[-2] <= e50.iloc[-2]
-    if cross and c.iloc[-1] > e200.iloc[-1] and adx.iloc[-1] > 20 and vx.iloc[-1] > 1.5:
-        return dict(entry=live_price, adx=float(adx.iloc[-1]), vx=float(vx.iloc[-1]), end=end)
+    if cross and c.iloc[-1] > e200.iloc[-1] and adx_v.iloc[-1] > 20 and vx.iloc[-1] > 1.5:
+        return dict(entry=live_price, adx=float(adx_v.iloc[-1]), vx=float(vx.iloc[-1]), end=end)
     return None
 
 def load_state(now):
@@ -102,7 +127,7 @@ if __name__ == "__main__":
     if not market_open_today(now, idx):
         print("Market closed today (holiday), nothing to do:", now); sys.exit()
 
-    data = fetch(b.get_universe(UNIVERSE))
+    data = fetch(get_universe())
     print("Stocks loaded:", len(data), "| time:", now)
     state, lines = load_state(now), []
     for sym, df in data.items():
@@ -117,3 +142,4 @@ if __name__ == "__main__":
     print("New signals:", len(lines))
     for i in range(0, len(lines), 4):
         send("\n\n".join(lines[i:i + 4]) + "\n\nBacktest: ~48% wins, ~+0.7% per trade. Not guaranteed. Not financial advice.")
+        
